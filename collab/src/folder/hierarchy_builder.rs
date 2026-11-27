@@ -189,6 +189,14 @@ impl NestedChildViewBuilder {
     self
   }
 
+  pub fn with_icon_url(mut self, url: &str) -> Self {
+    self.icon = Some(ViewIcon {
+      ty: IconType::Url,
+      value: url.to_string(),
+    });
+    self
+  }
+
   pub fn with_extra<F: FnOnce(ViewExtraBuilder) -> serde_json::Value>(mut self, extra: F) -> Self {
     let builder = ViewExtraBuilder::new();
     let extra_json = extra(builder);
@@ -287,6 +295,16 @@ impl ViewExtraBuilder {
       self.0[SPACE_ICON_COLOR_KEY] = json!(icon_color);
     }
     self.0[SPACE_CREATED_AT_KEY] = json!(space_info.space_created_at);
+    self
+  }
+
+  /// The cover of the view, shown by the clients that read it from the extra data of the view.
+  pub fn with_cover(mut self, cover_type: &str, value: &str, offset: Option<f64>) -> Self {
+    let mut cover = json!({ "type": cover_type, "value": value });
+    if let Some(offset) = offset {
+      cover["offset"] = json!(offset);
+    }
+    self.0["cover"] = cover;
     self
   }
 

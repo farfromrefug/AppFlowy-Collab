@@ -2,8 +2,11 @@ use crate::error::CollabError;
 use crate::importer::imported_collab::{ImportType, ImportedCollab, ImportedCollabInfo};
 
 use crate::database::database::{Database, get_row_document_id};
+use crate::database::entity::FieldType;
 use crate::database::template::csv::{CSVResource, CSVTemplate};
-use crate::document::blocks::{BlockType, TextDelta, mention_block_data, mention_block_delta};
+use crate::document::blocks::{
+  Block, BlockType, TextDelta, mention_block_data, mention_block_delta,
+};
 use crate::document::document::Document;
 use crate::document::importer::define::URL_FIELD;
 use crate::document::importer::md_importer::{MDImporter, create_image_block};
@@ -17,7 +20,10 @@ use crate::database::template::builder::FileUrlBuilder;
 use crate::document::document_data::default_document_data;
 use crate::entity::uuid_validation::RowId;
 use crate::importer::notion::file::NotionFile;
-use crate::importer::notion::walk_dir::{extract_delta_link, extract_external_links};
+use crate::importer::notion::html::{
+  ColumnKind, INLINE_DATABASE_FIELD, PageIcon, parse_notion_html, parse_notion_html_columns,
+};
+use crate::importer::notion::walk_dir::{extract_delta_link, extract_external_links, is_html_file};
 use crate::importer::notion::{CSVRelation, ImportedCollabInfoStream};
 use crate::importer::util::{FileId, upload_file_url};
 use percent_encoding::percent_decode_str;
@@ -134,14 +140,26 @@ impl NotionPage {
     search_view(&self.children, id)
   }
 
+  fn is_html(&self) -> bool {
+    self
+      .notion_file
+      .file_path()
+      .is_some_and(|path| is_html_file(path))
+  }
+
   pub async fn as_document(&self) -> Result<(Document, CollabResource), CollabError> {
     let external_link_views = self.get_external_link_notion_view();
     match &self.notion_file {
       NotionFile::Markdown { file_path, .. } => {
         let resource_paths = self.notion_file.upload_files();
-        let md_importer = MDImporter::new(None, false);
         let content = fs::read_to_string(file_path).await?;
-        let document_data = md_importer.import(&self.view_id, content)?;
+        let (document_data, cover, icon) = if is_html_file(file_path) {
+          let page = parse_notion_html(&self.view_id, &content);
+          (page.document, page.cover, page.icon)
+        } else {
+          let md_importer = MDImporter::new(None, false);
+          (md_importer.import(&self.view_id, content)?, None, None)
+        };
         let mut document = Document::create(&self.view_id, document_data, default_client_id())?;
 
         let url_builder = |view_id, path| async move {
@@ -163,6 +181,7 @@ impl NotionPage {
             &url_builder,
           )
           .await;
+        self.replace_inline_databases(parent_path, &mut document);
         let valid_block_resources = self
           .replace_block_resources_recursively(
             parent_path,
@@ -172,10 +191,31 @@ impl NotionPage {
           )
           .await;
 
-        let all_resources = valid_block_resources
+        let mut all_resources = valid_block_resources
           .into_iter()
           .chain(valid_delta_resources.into_iter())
           .collect::<Vec<_>>();
+
+        if let Some(cover) = cover {
+          if let Some(resource) = self
+            .set_cover(
+              parent_path,
+              &mut document,
+              &cover,
+              &resource_paths,
+              url_builder,
+            )
+            .await
+          {
+            all_resources.push(resource);
+          }
+        }
+
+        if let Some(PageIcon::Image(src)) = icon {
+          if let Some((_, Some(resource))) = self.image_url(&src).await {
+            all_resources.push(resource);
+          }
+        }
 
         let files = all_resources
           .iter()
@@ -199,6 +239,115 @@ impl NotionPage {
         self.notion_file
       ))),
     }
+  }
+
+  /// The URL of an image of the page, such as its icon, and the file of the export that has to be
+  /// uploaded for it, if any. `src` is a link or the path of a file of the export.
+  pub async fn image_url(&self, src: &str) -> Option<(String, Option<PathBuf>)> {
+    if src.starts_with("http://") || src.starts_with("https://") {
+      return Some((src.to_string(), None));
+    }
+    let decoded = percent_decode_str(src).decode_utf8().ok()?;
+    let path = self
+      .notion_file
+      .file_path()?
+      .parent()?
+      .join(decoded.as_ref());
+    let resource = self
+      .notion_file
+      .upload_files()
+      .into_iter()
+      .find(|r| *r == path)?;
+    let file_id = FileId::from_path(&path).await.ok()?;
+    let url = upload_file_url(&self.host, &self.workspace_id, &self.view_id, &file_id);
+    Some((url, Some(resource)))
+  }
+
+  /// Replace the paragraphs that stand for a database that the page shows with the database.
+  fn replace_inline_databases(&self, page_path: &Path, document: &mut Document) {
+    let Some(page_id) = document.get_page_id() else {
+      return;
+    };
+    let mut stack = vec![page_id];
+    while let Some(block_id) = stack.pop() {
+      if let Some((_, mut data)) = document.get_block_data(&block_id) {
+        if let Some(title) = data.remove(INLINE_DATABASE_FIELD) {
+          let database = title
+            .as_str()
+            .and_then(|title| self.csv_relation.find_page_by_name(title, page_path))
+            .and_then(|view| Some((Uuid::parse_str(&view.view_id).ok()?, view)));
+          let parent = document.get_block(&block_id).map(|block| block.parent);
+          if let (Some((view_uuid, view)), Some(parent)) = (database, parent) {
+            let block = Block {
+              id: crate::document::document_data::generate_id(),
+              ty: BlockType::Grid.to_string(),
+              data: HashMap::from([
+                ("view_id".to_string(), json!(view.view_id)),
+                ("parent_id".to_string(), json!(self.view_id)),
+                (
+                  "database_id".to_string(),
+                  json!(database_id_of(view_uuid).to_string()),
+                ),
+              ]),
+              parent,
+              children: String::new(),
+              external_id: None,
+              external_type: None,
+            };
+            let replaced = document
+              .insert_block(block, Some(block_id.clone()))
+              .and_then(|_| document.delete_block(&block_id));
+            if let Err(err) = replaced {
+              error!("Failed to show an inline database. error: {:?}", err);
+            }
+            continue;
+          }
+          if let Err(err) = document.update_block(&block_id, data) {
+            error!(
+              "Failed to update an inline database block. error: {:?}",
+              err
+            );
+          }
+        }
+      }
+      for child_id in document.get_block_children_ids(&block_id).into_iter().rev() {
+        stack.push(child_id);
+      }
+    }
+  }
+
+  /// Set the cover of the document. A cover that is a link is used as it is, a cover that is a
+  /// file of the export is uploaded, and its path is returned.
+  async fn set_cover<'a, B, O>(
+    &'a self,
+    parent_path: &Path,
+    document: &mut Document,
+    cover: &str,
+    resources: &[PathBuf],
+    file_url_builder: B,
+  ) -> Option<PathBuf>
+  where
+    B: Fn(&'a str, PathBuf) -> O + Send + Sync + 'a,
+    O: Future<Output = Option<String>> + Send + 'a,
+  {
+    let (url, resource) = if cover.starts_with("http://") || cover.starts_with("https://") {
+      (cover.to_string(), None)
+    } else {
+      let decoded = percent_decode_str(cover).decode_utf8().ok()?;
+      let path = parent_path.join(decoded.as_ref());
+      let resource = resources.iter().find(|r| **r == path)?.clone();
+      (file_url_builder(&self.view_id, path).await?, Some(resource))
+    };
+
+    let page_id = document.get_page_id()?;
+    let (_, mut data) = document.get_block_data(&page_id)?;
+    data.insert("cover_selection_type".to_string(), json!("CoverType.file"));
+    data.insert("cover_selection".to_string(), json!(url));
+    if let Err(err) = document.update_block(&page_id, data) {
+      error!("Failed to set the cover of a page. error: {:?}", err);
+      return None;
+    }
+    resource
   }
 
   async fn replace_block_resources_recursively<'a, B, O>(
@@ -346,7 +495,9 @@ impl NotionPage {
             if let Ok(links) = extract_external_links(&delta_str) {
               for link in &links {
                 if let Some(view) = external_link_views.get(&link.id) {
-                  if v == link.name {
+                  // Notion cuts the long names of the files of the export, so the text of the
+                  // link of a HTML page, which has the whole title, may be longer than the name.
+                  if v == link.name || (self.is_html() && v.trim().starts_with(link.name.trim())) {
                     is_changed = true;
                     *delta = mention_block_delta(&view.view_id);
                   }
@@ -427,7 +578,25 @@ impl NotionPage {
         row_documents,
         ..
       } => {
-        let content = fs::read_to_string(file_path).await?;
+        let mut content = fs::read_to_string(file_path).await?;
+        // The CSV file has the columns in the order of the properties, while the page of the
+        // database in a HTML export has them in the order of the table that Notion shows.
+        let mut field_types = HashMap::new();
+        if let Ok(html) = fs::read_to_string(file_path.with_extension("html")).await {
+          let columns = parse_notion_html_columns(&html);
+          let order: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
+          content = reorder_csv_columns(&content, &order).unwrap_or(content);
+          for column in columns {
+            let field_type = match column.kind {
+              Some(ColumnKind::Date) => FieldType::DateTime,
+              Some(ColumnKind::Select) => FieldType::SingleSelect,
+              Some(ColumnKind::MultiSelect) => FieldType::MultiSelect,
+              Some(ColumnKind::Checkbox) => FieldType::Checkbox,
+              None => continue,
+            };
+            field_types.insert(column.name, field_type);
+          }
+        }
         let files = self
           .notion_file
           .upload_files()
@@ -447,6 +616,9 @@ impl NotionPage {
         let view_uuid =
           uuid::Uuid::parse_str(&self.view_id).map_err(|err| CollabError::Internal(err.into()))?;
         csv_template.reset_view_id(view_uuid);
+        csv_template.override_field_types(&field_types);
+        // The pages that show the database have to know its id without building it.
+        csv_template.database_id = database_id_of(view_uuid);
         let database_id = csv_template.database_id;
 
         let file_url_builder = FileUrlBuilderImpl {
@@ -705,4 +877,77 @@ pub struct DatabaseImportContent {
   pub database: Database,
   pub row_documents: Vec<ImportedRowDocument>,
   pub resource: CollabResource,
+}
+
+/// The id of the database of the CSV file of the view `view_id`.
+fn database_id_of(view_id: Uuid) -> Uuid {
+  Uuid::new_v5(&view_id, b"database")
+}
+
+/// Move the columns of a CSV file that are in `order` to the front, in that order, and keep the
+/// other columns after them. The first column is the title of the rows, so it stays the first.
+fn reorder_csv_columns(content: &str, order: &[String]) -> Option<String> {
+  let mut reader = csv::ReaderBuilder::new()
+    .has_headers(false)
+    .flexible(true)
+    .from_reader(content.as_bytes());
+  let rows: Vec<csv::StringRecord> = reader.records().collect::<Result<_, _>>().ok()?;
+  let header = rows.first()?;
+
+  let mut columns: Vec<usize> = vec![0];
+  for name in order {
+    if let Some(index) = header
+      .iter()
+      .position(|field| field.trim_start_matches('\u{feff}') == name)
+    {
+      if !columns.contains(&index) {
+        columns.push(index);
+      }
+    }
+  }
+  if columns.len() == 1 {
+    return None;
+  }
+  let rest: Vec<usize> = (0..header.len())
+    .filter(|index| !columns.contains(index))
+    .collect();
+  columns.extend(rest);
+
+  let mut writer = csv::Writer::from_writer(vec![]);
+  for row in &rows {
+    writer
+      .write_record(columns.iter().map(|index| row.get(*index).unwrap_or("")))
+      .ok()?;
+  }
+  String::from_utf8(writer.into_inner().ok()?).ok()
+}
+
+#[cfg(test)]
+mod reorder_csv_columns_tests {
+  use super::reorder_csv_columns;
+
+  #[test]
+  fn shown_columns_come_first_in_the_order_of_the_table() {
+    let csv = "Name,Hidden,Date,Status\na,h,d,s\n";
+    let order = ["Name", "Status", "Date"].map(String::from);
+    assert_eq!(
+      reorder_csv_columns(csv, &order).unwrap(),
+      "Name,Status,Date,Hidden\na,s,d,h\n"
+    );
+  }
+
+  #[test]
+  fn the_title_stays_first() {
+    let csv = "Name,Date\na,d\n";
+    let order = ["Date", "Name"].map(String::from);
+    assert_eq!(
+      reorder_csv_columns(csv, &order).unwrap(),
+      "Name,Date\na,d\n"
+    );
+  }
+
+  #[test]
+  fn unknown_columns_leave_the_file_as_it_is() {
+    assert!(reorder_csv_columns("Name,Date\na,d\n", &["Other".to_string()]).is_none());
+  }
 }

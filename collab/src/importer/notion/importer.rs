@@ -5,10 +5,13 @@ use crate::folder::hierarchy_builder::{
 use crate::folder::{SpaceInfo, SpacePermission, ViewLayout};
 use crate::importer::imported_collab::{ImportType, ImportedCollab, ImportedCollabInfo};
 use crate::importer::notion::file::NotionFile;
+use crate::importer::notion::html::{PageHeader, PageIcon, parse_notion_html_header};
 use crate::importer::notion::page::{
   CollabResource, NotionPage, build_imported_collab_recursively,
 };
-use crate::importer::notion::walk_dir::{file_name_from_path, process_entry, walk_sub_dir};
+use crate::importer::notion::walk_dir::{
+  file_name_from_path, is_html_file, process_entry, walk_sub_dir,
+};
 use futures::stream;
 use futures::stream::{Stream, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -20,7 +23,7 @@ use crate::preclude::Collab;
 use anyhow::{Error, anyhow};
 use csv::Reader;
 use fancy_regex::Regex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
@@ -101,9 +104,11 @@ impl NotionImporter {
     .unwrap_or_default();
 
     let no_subpages = !has_subdirectories(&self.path, 1);
+    let html = is_html_export(&self.path);
     let notion_export = NotionExportContext {
       csv_relation,
       no_subpages,
+      html,
     };
 
     let path = self.path.clone();
@@ -144,6 +149,19 @@ impl NotionImporter {
 
     Ok(pages)
   }
+}
+
+/// Whether the pages of a Notion export are HTML files rather than Markdown files.
+fn is_html_export(path: &PathBuf) -> bool {
+  let mut has_html = false;
+  for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+    match entry.path().extension().and_then(|ext| ext.to_str()) {
+      Some("md") => return false,
+      Some("html") => has_html = true,
+      _ => {},
+    }
+  }
+  has_html
 }
 
 #[derive(Debug)]
@@ -322,6 +340,32 @@ async fn convert_notion_page_to_parent_child(
       uuid::Uuid::parse_str(&notion_page.view_id).unwrap_or_else(|_| uuid::Uuid::nil())
     });
 
+  if let Some(header) = html_page_header(&notion_page.notion_file).await {
+    match header.icon {
+      Some(PageIcon::Emoji(emoji)) => view_builder = view_builder.with_icon(&emoji),
+      Some(PageIcon::Image(src)) => {
+        if let Some((url, _)) = notion_page.image_url(&src).await {
+          view_builder = view_builder.with_icon_url(&url);
+        }
+      },
+      None => {},
+    }
+    if let Some(cover) = &header.cover {
+      if let Some((url, _)) = notion_page.image_url(cover).await {
+        let cover_type = if url.contains("images.unsplash.com") {
+          "unsplash"
+        } else {
+          "custom"
+        };
+        view_builder = view_builder.with_extra(|extra| {
+          extra
+            .with_cover(cover_type, &url, header.cover_offset)
+            .build()
+        });
+      }
+    }
+  }
+
   for child_notion_page in &notion_page.children {
     view_builder = view_builder
       .with_child_view_builder(|_| async {
@@ -333,9 +377,24 @@ async fn convert_notion_page_to_parent_child(
   view_builder.build()
 }
 
+/// The icon and the cover of a page of a HTML export. The Markdown export has none.
+async fn html_page_header(notion_file: &NotionFile) -> Option<PageHeader> {
+  let NotionFile::Markdown { file_path, .. } = notion_file else {
+    return None;
+  };
+  if !is_html_file(file_path) {
+    return None;
+  }
+  let content = tokio::fs::read_to_string(file_path).await.ok()?;
+  Some(parse_notion_html_header(&content))
+}
+
 pub struct NotionExportContext {
   pub csv_relation: CSVRelation,
   pub no_subpages: bool,
+  /// Whether the pages of the export are HTML files, as opposed to Markdown files. A HTML export
+  /// has one CSV file for each database, which is the whole database.
+  pub html: bool,
 }
 
 /// [CSVRelation] manages parent-child relationships between CSV files exported in zip format from Notion.
@@ -366,6 +425,25 @@ impl CSVRelation {
   pub fn get_page(&self, file_name: &str) -> Option<NotionPage> {
     let path = self.inner.get(&file_name.to_lowercase())?;
     self.page_by_path_buf.lock().ok()?.get(path).cloned()
+  }
+
+  /// The database that has the title `name`. A title that Notion cut to name the file matches too,
+  /// and the database that is the closest to `near` wins.
+  pub fn find_page_by_name(&self, name: &str, near: &Path) -> Option<NotionPage> {
+    let name = name.trim();
+    let pages = self.page_by_path_buf.lock().ok()?;
+    let mut candidates: Vec<(&PathBuf, &NotionPage)> = pages
+      .iter()
+      .filter(|(_, page)| {
+        let page_name = page.notion_name.trim();
+        !page_name.is_empty() && (page_name == name || name.starts_with(page_name))
+      })
+      .collect();
+    candidates.sort_by_key(|(path, page)| {
+      let same_dir = path.parent() == near.parent();
+      (!same_dir, page.notion_name.trim() != name, (*path).clone())
+    });
+    candidates.first().map(|(_, page)| (*page).clone())
   }
 
   pub fn set_page_by_path_buf(&self, path_buf: PathBuf, page: NotionPage) {

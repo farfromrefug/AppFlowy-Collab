@@ -1,4 +1,4 @@
 pub mod define;
-mod delta;
+pub(crate) mod delta;
 pub mod md_importer;
-mod util;
+pub(crate) mod util;

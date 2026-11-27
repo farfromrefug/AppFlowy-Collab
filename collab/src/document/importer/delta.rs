@@ -15,6 +15,12 @@ pub struct Operation {
   attributes: Vec<(String, Value)>,
 }
 
+impl Operation {
+  pub(crate) fn insert(&self) -> &str {
+    &self.insert
+  }
+}
+
 impl TryFrom<Value> for Operation {
   type Error = CollabError;
 
