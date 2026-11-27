@@ -2,6 +2,7 @@ use crate::error::ImporterError;
 use crate::imported_collab::{ImportType, ImportedCollab, ImportedCollabInfo};
 
 use collab_database::database::{Database, get_row_document_id};
+use collab_database::entity::FieldType;
 use collab_database::template::csv::{CSVResource, CSVTemplate};
 use collab_document::blocks::{
   Block, BlockType, TextDelta, mention_block_data, mention_block_delta,
@@ -14,7 +15,7 @@ use futures::stream::{self, StreamExt};
 
 use crate::notion::file::NotionFile;
 use crate::notion::html::{
-  INLINE_DATABASE_FIELD, PageIcon, parse_notion_html, parse_notion_html_columns,
+  ColumnKind, INLINE_DATABASE_FIELD, PageIcon, parse_notion_html, parse_notion_html_columns,
 };
 use crate::notion::walk_dir::{extract_delta_link, extract_external_links, is_html_file};
 use crate::notion::{CSVRelation, ImportedCollabInfoStream};
@@ -646,9 +647,21 @@ impl NotionPage {
         let mut content = fs::read_to_string(file_path).await?;
         // The CSV file has the columns in the order of the properties, while the page of the
         // database in a HTML export has them in the order of the table that Notion shows.
+        let mut field_types = HashMap::new();
         if let Ok(html) = fs::read_to_string(file_path.with_extension("html")).await {
-          let order = parse_notion_html_columns(&html);
+          let columns = parse_notion_html_columns(&html);
+          let order: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
           content = reorder_csv_columns(&content, &order).unwrap_or(content);
+          for column in columns {
+            let field_type = match column.kind {
+              Some(ColumnKind::Date) => FieldType::DateTime,
+              Some(ColumnKind::Select) => FieldType::SingleSelect,
+              Some(ColumnKind::MultiSelect) => FieldType::MultiSelect,
+              Some(ColumnKind::Checkbox) => FieldType::Checkbox,
+              None => continue,
+            };
+            field_types.insert(column.name, field_type);
+          }
         }
         let files = self
           .notion_file
@@ -667,6 +680,7 @@ impl NotionPage {
         let mut csv_template =
           CSVTemplate::try_from_reader(content.as_bytes(), true, Some(csv_resource))?;
         csv_template.reset_view_id(self.view_id.clone());
+        csv_template.override_field_types(&field_types);
         // The pages that show the database have to know its id without building it.
         if let Some(id) = database_id_of(&self.view_id) {
           csv_template.database_id = id;

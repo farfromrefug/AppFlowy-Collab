@@ -96,17 +96,101 @@ pub fn parse_notion_html_header(html: &str) -> PageHeader {
   page_header(&Html::parse_document(html))
 }
 
-/// The names of the columns of the database that a page of a Notion HTML export shows, in the
-/// order of its table. Columns that the view hides are not part of it.
-pub fn parse_notion_html_columns(html: &str) -> Vec<String> {
+/// What a column of a database of a Notion HTML export holds, when its cells tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnKind {
+  Date,
+  Select,
+  MultiSelect,
+  Checkbox,
+}
+
+/// A column of the database that a page of a Notion HTML export shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlColumn {
+  pub name: String,
+  pub kind: Option<ColumnKind>,
+}
+
+/// The columns of the database that a page of a Notion HTML export shows, in the order of its
+/// table. Columns that the view hides are not part of it. The kind of a column comes from what its
+/// cells are made of, because the CSV file only has their text.
+pub fn parse_notion_html_columns(html: &str) -> Vec<HtmlColumn> {
   let html = Html::parse_document(html);
-  let Ok(selector) = Selector::parse("table.collection-content thead th") else {
+  let (Ok(table), Ok(th), Ok(tr), Ok(td), Ok(img)) = (
+    Selector::parse("table.collection-content"),
+    Selector::parse("thead th"),
+    Selector::parse("tbody tr"),
+    Selector::parse(":scope > td"),
+    Selector::parse("img"),
+  ) else {
     return vec![];
   };
-  html
-    .select(&selector)
-    .map(|th| th.text().collect::<String>().trim().to_string())
+  let Some(table) = html.select(&table).next() else {
+    return vec![];
+  };
+  let rows: Vec<Vec<ElementRef>> = table
+    .select(&tr)
+    .map(|row| row.select(&td).collect())
+    .collect();
+
+  table
+    .select(&th)
+    .enumerate()
+    .map(|(index, th)| {
+      let icon = th
+        .select(&img)
+        .next()
+        .and_then(|img| img.value().attr("src"))
+        .and_then(notion_icon_name);
+      let cells: Vec<ElementRef> = rows
+        .iter()
+        .filter_map(|row| row.get(index).copied())
+        .filter(|cell| cell.children().next().is_some())
+        .collect();
+      HtmlColumn {
+        name: th.text().collect::<String>().trim().to_string(),
+        kind: column_kind(&cells, icon),
+      }
+    })
     .collect()
+}
+
+fn column_kind(cells: &[ElementRef], icon: Option<&str>) -> Option<ColumnKind> {
+  if cells.is_empty() {
+    return None;
+  }
+  let count = |selector: &str| -> Vec<usize> {
+    let Ok(selector) = Selector::parse(selector) else {
+      return vec![];
+    };
+    cells
+      .iter()
+      .map(|cell| cell.select(&selector).count())
+      .collect()
+  };
+  let all = |counts: &[usize]| counts.len() == cells.len() && counts.iter().all(|n| *n > 0);
+
+  if all(&count("time")) {
+    return Some(ColumnKind::Date);
+  }
+  if all(&count(".checkbox")) {
+    return Some(ColumnKind::Checkbox);
+  }
+  let options: Vec<usize> = count(".selected-value, .status-value");
+  if all(&options) {
+    // A property of the kind "multi-select" has the icon of a list.
+    return Some(if icon == Some("list") || options.iter().any(|n| *n > 1) {
+      ColumnKind::MultiSelect
+    } else {
+      ColumnKind::Select
+    });
+  }
+  // AppFlowy has no kind for people, their names are tags.
+  if all(&count(".user")) {
+    return Some(ColumnKind::MultiSelect);
+  }
+  None
 }
 
 fn page_header(html: &Html) -> PageHeader {
