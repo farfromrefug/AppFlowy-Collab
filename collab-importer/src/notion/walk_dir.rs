@@ -8,6 +8,7 @@ use percent_encoding::percent_decode_str;
 
 use crate::notion::NotionExportContext;
 use crate::notion::file::{NotionFile, Resource, process_row_md_content};
+use crate::notion::html::parse_notion_html;
 use crate::notion::page::{ExternalLink, ExternalLinkType, ImportedRowDocument, NotionPage};
 use crate::util::parse_csv;
 
@@ -89,7 +90,7 @@ pub(crate) fn process_entry(
   }
 
   let path = current_entry.path();
-  let ext = get_file_extension(path, include_partial_csv);
+  let ext = get_file_extension(path, include_partial_csv, notion_export.html);
   if ext.is_file() {
     // Check if there's a corresponding directory for this .md file and skip it if so
     process_file(host, workspace_id, path, ext, notion_export)
@@ -97,14 +98,39 @@ pub(crate) fn process_entry(
     // If the path is a directory, it should contain a file with the same name but with either a .md or .csv extension.
     // If no such file is found, the directory will be treated as a space.
     // Proceed to extract the name and ID for the directory.
-    let (name, id) = name_and_id_from_path(path).ok()?;
+    let (name, mut id) = name_and_id_from_path(path).ok()?;
 
-    // Look for the corresponding .md file for this directory in the parent directory
+    // Look for the page file of this directory in the parent directory. Notion names the
+    // directory after the page (with or without its id) and the page file after the page and id.
     let parent_path = path.parent()?;
-    let md_file_path = parent_path.join(format!("{}.md", entry_name));
-    let all_csv_file_path = parent_path.join(format!("{}_all.csv", entry_name));
-    let csv_file_path = parent_path.join(format!("{}.csv", entry_name));
-    if md_file_path.exists() {
+    let md_file_path = sibling_page_file(parent_path, entry_name, ".md").or_else(|| {
+      notion_export
+        .html
+        .then(|| sibling_page_file(parent_path, entry_name, ".html"))
+        .flatten()
+    });
+    let all_csv_file_path = sibling_page_file(parent_path, entry_name, "_all.csv");
+    let mut csv_file_path = sibling_page_file(parent_path, entry_name, ".csv");
+    // A HTML export has a single CSV file for a database, and a page of the database as well.
+    let (md_file_path, all_csv_file_path) = if notion_export.html {
+      let database_csv = all_csv_file_path.or_else(|| csv_file_path.clone());
+      csv_file_path = database_csv.clone();
+      if database_csv.is_some() {
+        (None, database_csv)
+      } else {
+        (md_file_path, None)
+      }
+    } else {
+      (md_file_path, all_csv_file_path)
+    };
+    if id.is_none() {
+      id = md_file_path
+        .as_ref()
+        .or(all_csv_file_path.as_ref())
+        .and_then(|file| name_and_id_from_path(file).ok())
+        .and_then(|(_, id)| id);
+    }
+    if let Some(md_file_path) = md_file_path {
       process_md_dir(
         host,
         workspace_id,
@@ -115,7 +141,7 @@ pub(crate) fn process_entry(
         include_partial_csv,
         notion_export,
       )
-    } else if all_csv_file_path.exists() {
+    } else if let Some(all_csv_file_path) = all_csv_file_path {
       process_csv_dir(
         entry_name,
         host,
@@ -124,7 +150,7 @@ pub(crate) fn process_entry(
         id,
         parent_path,
         &all_csv_file_path,
-        &csv_file_path,
+        csv_file_path.as_ref(),
         notion_export,
       )
     } else {
@@ -175,7 +201,7 @@ fn process_csv_dir(
   id: Option<String>,
   parent_path: &Path,
   all_csv_file_path: &PathBuf,
-  csv_file_path: &PathBuf,
+  csv_file_path: Option<&PathBuf>,
   notion_export: &NotionExportContext,
 ) -> Option<NotionPage> {
   let mut resources = vec![];
@@ -189,7 +215,7 @@ fn process_csv_dir(
   let mut row_documents = vec![];
 
   // collect all sub entries whose entries are directory
-  if csv_file_path.exists() {
+  if let Some(csv_file_path) = csv_file_path {
     let csv_file = parse_csv(csv_file_path);
     let csv_dir = parent_path.join(file_name);
     if csv_dir.exists() {
@@ -220,7 +246,15 @@ fn process_csv_dir(
                   //  Text: ...
                   //                           <- second empty line
                   //  Content
-                  if process_row_md_content(md_content, file_path).is_ok() {
+                  //
+                  // A page of a HTML export has its properties in a table of its own, so it is
+                  // a row document when it has content.
+                  let is_row_document = if is_html_file(file_path) {
+                    parse_notion_html("row", &md_content).has_content
+                  } else {
+                    process_row_md_content(md_content, file_path).is_ok()
+                  };
+                  if is_row_document {
                     // remove page's children that can be found in the csv_relation
                     page.children.retain(|child| {
                       if let Some(file_path) = child.notion_file.file_path() {
@@ -325,6 +359,8 @@ fn process_md_dir(
     }
   }
 
+  sort_children_by_link_order(&mut children, md_file_path);
+
   let file_size = get_file_size(md_file_path).ok()?;
   let notion_file = NotionFile::Markdown {
     file_path: md_file_path.clone(),
@@ -343,6 +379,74 @@ fn process_md_dir(
     is_dir: false,
     csv_relation: notion_export.csv_relation.clone(),
   })
+}
+
+/// Notion exports sub pages as files in a directory, which are walked in file name order, while
+/// the sidebar shows them in the order their links appear in the parent page. Restore that order;
+/// children the parent page does not link to keep their place after the linked ones.
+fn sort_children_by_link_order(children: &mut [NotionPage], md_file_path: &Path) {
+  let Ok(content) = std::fs::read_to_string(md_file_path) else {
+    return;
+  };
+  children.sort_by_cached_key(|child| {
+    child
+      .notion_id
+      .as_deref()
+      .and_then(|id| content.find(id))
+      .unwrap_or(usize::MAX)
+  });
+}
+
+/// Strip the trailing Notion id (`<name> <32 hex>`) from a file stem or directory name.
+fn strip_notion_id(name: &str) -> Option<&str> {
+  let (name, id) = name.rsplit_once(' ')?;
+  (id.len() == 32 && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))).then_some(name)
+}
+
+/// The page file next to a directory: `<dir>{suffix}`, or `<dir> <id>{suffix}` when the directory
+/// is named without the page id. Ambiguous when several pages share the title, so none is chosen.
+fn sibling_page_file(parent: &Path, dir_name: &str, suffix: &str) -> Option<PathBuf> {
+  let exact = parent.join(format!("{dir_name}{suffix}"));
+  if exact.exists() {
+    return Some(exact);
+  }
+  let mut matches = std::fs::read_dir(parent)
+    .ok()?
+    .filter_map(|entry| entry.ok())
+    .filter(|entry| {
+      let file_name = entry.file_name();
+      file_name
+        .to_str()
+        .and_then(|file_name| file_name.strip_suffix(suffix))
+        .and_then(strip_notion_id)
+        == Some(dir_name)
+    })
+    .map(|entry| entry.path());
+  let first = matches.next()?;
+  matches.next().is_none().then_some(first)
+}
+
+/// Whether a page file is the one [`sibling_page_file`] pairs with a directory, in which case the
+/// directory carries the page.
+fn has_page_directory(path: &Path, suffix: &str) -> bool {
+  let (Some(parent), Some(file_name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+  else {
+    return false;
+  };
+  let Some(stem) = file_name.strip_suffix(suffix) else {
+    return false;
+  };
+  if parent.join(stem).is_dir() {
+    return true;
+  }
+  strip_notion_id(stem).is_some_and(|dir_name| {
+    parent.join(dir_name).is_dir()
+      && sibling_page_file(parent, dir_name, suffix).as_deref() == Some(path)
+  })
+}
+
+pub(crate) fn is_html_file(path: &Path) -> bool {
+  path.extension().is_some_and(|ext| ext == "html")
 }
 
 fn process_file(
@@ -374,15 +478,15 @@ fn process_csv_file(
   // a folder with the same name as the CSV file may be generated.
   // For example, if the CSV file is named "abc_all.csv", a folder named "abc" will also be created.
   // In such cases, we should skip processing the CSV file.
-  if let Some(parent) = path.parent() {
-    let parent_path = parent.join(file_name.trim_end_matches("_all.csv"));
-    if parent_path.is_dir() {
-      return None;
-    }
+  if has_page_directory(path, "_all.csv")
+    || (notion_export.html && has_page_directory(path, ".csv"))
+  {
+    return None;
   }
 
-  // Sometime, the exported csv might contains abc_all.csv or abc.csv. Just keep the abc_all.csv
-  if !include_partial_csv && !file_name.ends_with("_all.csv") {
+  // Sometime, the exported csv might contains abc_all.csv or abc.csv. Just keep the abc_all.csv.
+  // A HTML export has only abc.csv.
+  if !include_partial_csv && !notion_export.html && !file_name.ends_with("_all.csv") {
     // If the file name does not end with "_all", return None
     return None;
   }
@@ -427,12 +531,13 @@ fn process_md_file(
   path: &Path,
   notion_export: &NotionExportContext,
 ) -> Option<NotionPage> {
-  if let Some(parent) = path.parent() {
-    let file_stem = path.file_stem()?.to_str()?;
-    let corresponding_dir = parent.join(file_stem);
-    if corresponding_dir.is_dir() {
-      return None; // Skip .md or .csv file if there's a corresponding directory
-    }
+  let suffix = if is_html_file(path) { ".html" } else { ".md" };
+  if has_page_directory(path, suffix) {
+    return None; // Skip .md file if there's a corresponding directory
+  }
+  // The CSV file of a database is the database, its page is not imported as a document.
+  if notion_export.html && path.with_extension("csv").exists() {
+    return None;
   }
 
   // Process the file normally if it doesn't correspond to a directory
@@ -464,6 +569,16 @@ fn process_md_file(
 // Main function to get all links from a markdown file
 pub(crate) fn get_md_links(md_file_path: &Path) -> Result<Vec<Vec<ExternalLink>>, ImporterError> {
   let content = std::fs::read_to_string(md_file_path)?;
+  if is_html_file(md_file_path) {
+    return Ok(
+      parse_notion_html("links", &content)
+        .links
+        .iter()
+        .filter_map(|link| extract_external_links(link).ok())
+        .collect(),
+    );
+  }
+
   let ast =
     to_mdast(&content, &ParseOptions::default()).map_err(ImporterError::ParseMarkdownError)?;
   let mut links = Vec::new();
@@ -505,7 +620,7 @@ pub(crate) fn collect_links_from_node(node: &Node, links: &mut Vec<String>) {
 }
 fn link_type_from_extension(extension: Option<&str>) -> ExternalLinkType {
   match extension {
-    Some("md") => ExternalLinkType::Markdown,
+    Some("md" | "html") => ExternalLinkType::Markdown,
     Some("csv") => ExternalLinkType::CSV,
     _ => ExternalLinkType::Unknown,
   }
@@ -601,11 +716,13 @@ impl FileExtension {
   }
 }
 
-fn get_file_extension(path: &Path, include_partial_csv: bool) -> FileExtension {
+fn get_file_extension(path: &Path, include_partial_csv: bool, html: bool) -> FileExtension {
   path
     .extension()
     .map_or(FileExtension::Unknown, |ext| match ext.to_str() {
       Some("md") => FileExtension::Markdown,
+      // The pages of a HTML export. In other exports, HTML files are attachments.
+      Some("html") if html => FileExtension::Markdown,
       Some("csv") => FileExtension::Csv {
         include_partial_csv,
       },
@@ -644,7 +761,7 @@ fn notion_file_from_path(path: &Path, no_subpages: bool) -> Option<NotionFile> {
   let file_size = get_file_size(&path.to_path_buf()).ok()?;
 
   match extension {
-    "md" => {
+    "md" | "html" => {
       let mut resources = vec![];
       if no_subpages {
         if let Some(parent_path) = path.parent() {

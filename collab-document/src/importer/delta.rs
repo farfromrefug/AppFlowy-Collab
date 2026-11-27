@@ -31,6 +31,12 @@ pub enum ConversionError {
   InvalidInsert,
 }
 
+impl Operation {
+  pub fn insert(&self) -> &str {
+    &self.insert
+  }
+}
+
 impl TryFrom<Value> for Operation {
   type Error = ConversionError;
 

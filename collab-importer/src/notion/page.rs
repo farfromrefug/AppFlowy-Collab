@@ -11,7 +11,8 @@ use collab_entity::CollabType;
 use futures::stream::{self, StreamExt};
 
 use crate::notion::file::NotionFile;
-use crate::notion::walk_dir::{extract_delta_link, extract_external_links};
+use crate::notion::html::parse_notion_html;
+use crate::notion::walk_dir::{extract_delta_link, extract_external_links, is_html_file};
 use crate::notion::{CSVRelation, ImportedCollabInfoStream};
 use crate::util::{FileId, upload_file_url};
 use collab::core::collab::default_client_id;
@@ -132,14 +133,26 @@ impl NotionPage {
     search_view(&self.children, id)
   }
 
+  fn is_html(&self) -> bool {
+    self
+      .notion_file
+      .file_path()
+      .is_some_and(|path| is_html_file(path))
+  }
+
   pub async fn as_document(&self) -> Result<(Document, CollabResource), ImporterError> {
     let external_link_views = self.get_external_link_notion_view();
     match &self.notion_file {
       NotionFile::Markdown { file_path, .. } => {
         let resource_paths = self.notion_file.upload_files();
-        let md_importer = MDImporter::new(None);
         let content = fs::read_to_string(file_path).await?;
-        let document_data = md_importer.import(&self.view_id, content)?;
+        let (document_data, cover) = if is_html_file(file_path) {
+          let page = parse_notion_html(&self.view_id, &content);
+          (page.document, page.cover)
+        } else {
+          let md_importer = MDImporter::new(None);
+          (md_importer.import(&self.view_id, content)?, None)
+        };
         let mut document = Document::create(&self.view_id, document_data, default_client_id())?;
 
         let url_builder = |view_id, path| async move {
@@ -170,10 +183,25 @@ impl NotionPage {
           )
           .await;
 
-        let all_resources = valid_block_resources
+        let mut all_resources = valid_block_resources
           .into_iter()
           .chain(valid_delta_resources.into_iter())
           .collect::<Vec<_>>();
+
+        if let Some(cover) = cover {
+          if let Some(resource) = self
+            .set_cover(
+              parent_path,
+              &mut document,
+              &cover,
+              &resource_paths,
+              url_builder,
+            )
+            .await
+          {
+            all_resources.push(resource);
+          }
+        }
 
         let files = all_resources
           .iter()
@@ -192,6 +220,40 @@ impl NotionPage {
         self.notion_file
       ))),
     }
+  }
+
+  /// Set the cover of the document. A cover that is a link is used as it is, a cover that is a
+  /// file of the export is uploaded, and its path is returned.
+  async fn set_cover<'a, B, O>(
+    &'a self,
+    parent_path: &Path,
+    document: &mut Document,
+    cover: &str,
+    resources: &[PathBuf],
+    file_url_builder: B,
+  ) -> Option<PathBuf>
+  where
+    B: Fn(&'a str, PathBuf) -> O + Send + Sync + 'a,
+    O: Future<Output = Option<String>> + Send + 'a,
+  {
+    let (url, resource) = if cover.starts_with("http://") || cover.starts_with("https://") {
+      (cover.to_string(), None)
+    } else {
+      let decoded = percent_decode_str(cover).decode_utf8().ok()?;
+      let path = parent_path.join(decoded.as_ref());
+      let resource = resources.iter().find(|r| **r == path)?.clone();
+      (file_url_builder(&self.view_id, path).await?, Some(resource))
+    };
+
+    let page_id = document.get_page_id()?;
+    let (_, mut data) = document.get_block_data(&page_id)?;
+    data.insert("cover_selection_type".to_string(), json!("CoverType.file"));
+    data.insert("cover_selection".to_string(), json!(url));
+    if let Err(err) = document.update_block(&page_id, data) {
+      error!("Failed to set the cover of a page. error: {:?}", err);
+      return None;
+    }
+    resource
   }
 
   async fn replace_block_resources_recursively<'a, B, O>(
@@ -415,7 +477,9 @@ impl NotionPage {
             if let Ok(links) = extract_external_links(&delta_str) {
               for link in &links {
                 if let Some(view) = external_link_views.get(&link.id) {
-                  if v == link.name {
+                  // Notion cuts the long names of the files of the export, so the text of the
+                  // link of a HTML page, which has the whole title, may be longer than the name.
+                  if v == link.name || (self.is_html() && v.trim().starts_with(link.name.trim())) {
                     is_changed = true;
                     *delta = mention_block_delta(&view.view_id);
                   }

@@ -1,8 +1,9 @@
 use crate::error::ImporterError;
 use crate::imported_collab::{ImportType, ImportedCollab, ImportedCollabInfo};
 use crate::notion::file::NotionFile;
+use crate::notion::html::{PageIcon, parse_notion_html};
 use crate::notion::page::{CollabResource, NotionPage, build_imported_collab_recursively};
-use crate::notion::walk_dir::{file_name_from_path, process_entry, walk_sub_dir};
+use crate::notion::walk_dir::{file_name_from_path, is_html_file, process_entry, walk_sub_dir};
 use collab_folder::hierarchy_builder::{
   NestedChildViewBuilder, NestedViews, ParentChildViews, ViewExtraBuilder,
 };
@@ -91,9 +92,11 @@ impl NotionImporter {
     .unwrap_or_default();
 
     let no_subpages = !has_subdirectories(&self.path, 1);
+    let html = is_html_export(&self.path);
     let notion_export = NotionExportContext {
       csv_relation,
       no_subpages,
+      html,
     };
 
     let path = self.path.clone();
@@ -134,6 +137,19 @@ impl NotionImporter {
 
     Ok(pages)
   }
+}
+
+/// Whether the pages of a Notion export are HTML files rather than Markdown files.
+fn is_html_export(path: &PathBuf) -> bool {
+  let mut has_html = false;
+  for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+    match entry.path().extension().and_then(|ext| ext.to_str()) {
+      Some("md") => return false,
+      Some("html") => has_html = true,
+      _ => {},
+    }
+  }
+  has_html
 }
 
 #[derive(Debug)]
@@ -305,6 +321,10 @@ async fn convert_notion_page_to_parent_child(
     .with_layout(view_layout)
     .with_view_id(&notion_page.view_id);
 
+  if let Some(PageIcon::Emoji(emoji)) = html_page_icon(&notion_page.notion_file).await {
+    view_builder = view_builder.with_icon(&emoji);
+  }
+
   for child_notion_page in &notion_page.children {
     view_builder = view_builder
       .with_child_view_builder(|_| async {
@@ -316,9 +336,24 @@ async fn convert_notion_page_to_parent_child(
   view_builder.build()
 }
 
+/// The icon of a page of a HTML export. The Markdown export has none.
+async fn html_page_icon(notion_file: &NotionFile) -> Option<PageIcon> {
+  let NotionFile::Markdown { file_path, .. } = notion_file else {
+    return None;
+  };
+  if !is_html_file(file_path) {
+    return None;
+  }
+  let content = tokio::fs::read_to_string(file_path).await.ok()?;
+  parse_notion_html("icon", &content).icon
+}
+
 pub struct NotionExportContext {
   pub csv_relation: CSVRelation,
   pub no_subpages: bool,
+  /// Whether the pages of the export are HTML files, as opposed to Markdown files. A HTML export
+  /// has one CSV file for each database, which is the whole database.
+  pub html: bool,
 }
 
 /// [CSVRelation] manages parent-child relationships between CSV files exported in zip format from Notion.
