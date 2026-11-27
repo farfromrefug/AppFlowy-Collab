@@ -291,6 +291,16 @@ impl ViewExtraBuilder {
     self
   }
 
+  /// The cover of the view, shown by the clients that read it from the extra data of the view.
+  pub fn with_cover(mut self, cover_type: &str, value: &str, offset: Option<f64>) -> Self {
+    let mut cover = json!({ "type": cover_type, "value": value });
+    if let Some(offset) = offset {
+      cover["offset"] = json!(offset);
+    }
+    self.0["cover"] = cover;
+    self
+  }
+
   pub fn build(self) -> serde_json::Value {
     self.0
   }

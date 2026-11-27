@@ -1,7 +1,7 @@
 use crate::error::ImporterError;
 use crate::imported_collab::{ImportType, ImportedCollab, ImportedCollabInfo};
 use crate::notion::file::NotionFile;
-use crate::notion::html::{PageIcon, parse_notion_html};
+use crate::notion::html::{PageHeader, PageIcon, parse_notion_html_header};
 use crate::notion::page::{CollabResource, NotionPage, build_imported_collab_recursively};
 use crate::notion::walk_dir::{file_name_from_path, is_html_file, process_entry, walk_sub_dir};
 use collab_folder::hierarchy_builder::{
@@ -321,14 +321,30 @@ async fn convert_notion_page_to_parent_child(
     .with_layout(view_layout)
     .with_view_id(&notion_page.view_id);
 
-  match html_page_icon(&notion_page.notion_file).await {
-    Some(PageIcon::Emoji(emoji)) => view_builder = view_builder.with_icon(&emoji),
-    Some(PageIcon::Image(src)) => {
-      if let Some((url, _)) = notion_page.icon_image(&src).await {
-        view_builder = view_builder.with_icon_url(&url);
+  if let Some(header) = html_page_header(&notion_page.notion_file).await {
+    match header.icon {
+      Some(PageIcon::Emoji(emoji)) => view_builder = view_builder.with_icon(&emoji),
+      Some(PageIcon::Image(src)) => {
+        if let Some((url, _)) = notion_page.image_url(&src).await {
+          view_builder = view_builder.with_icon_url(&url);
+        }
+      },
+      None => {},
+    }
+    if let Some(cover) = &header.cover {
+      if let Some((url, _)) = notion_page.image_url(cover).await {
+        let cover_type = if url.contains("images.unsplash.com") {
+          "unsplash"
+        } else {
+          "custom"
+        };
+        view_builder = view_builder.with_extra(|extra| {
+          extra
+            .with_cover(cover_type, &url, header.cover_offset)
+            .build()
+        });
       }
-    },
-    None => {},
+    }
   }
 
   for child_notion_page in &notion_page.children {
@@ -342,8 +358,8 @@ async fn convert_notion_page_to_parent_child(
   view_builder.build()
 }
 
-/// The icon of a page of a HTML export. The Markdown export has none.
-async fn html_page_icon(notion_file: &NotionFile) -> Option<PageIcon> {
+/// The icon and the cover of a page of a HTML export. The Markdown export has none.
+async fn html_page_header(notion_file: &NotionFile) -> Option<PageHeader> {
   let NotionFile::Markdown { file_path, .. } = notion_file else {
     return None;
   };
@@ -351,7 +367,7 @@ async fn html_page_icon(notion_file: &NotionFile) -> Option<PageIcon> {
     return None;
   }
   let content = tokio::fs::read_to_string(file_path).await.ok()?;
-  parse_notion_html("icon", &content).icon
+  Some(parse_notion_html_header(&content))
 }
 
 pub struct NotionExportContext {

@@ -44,6 +44,8 @@ pub struct NotionHtmlPage {
   pub icon: Option<PageIcon>,
   /// The cover image, either a link or the path of a file of the export.
   pub cover: Option<String>,
+  /// How far the cover is moved, from -1 (top of the image shown) to 1 (bottom of it).
+  pub cover_offset: Option<f64>,
   pub document: DocumentData,
   /// The `href` of every link of the page, in order.
   pub links: Vec<String>,
@@ -66,10 +68,11 @@ pub fn parse_notion_html(document_id: &str, html: &str) -> NotionHtmlPage {
     .children_map
     .get(document_id)
     .is_some_and(|children| !children.is_empty());
-  let (icon, cover) = page_header(&html);
+  let header = page_header(&html);
   NotionHtmlPage {
-    icon,
-    cover,
+    icon: header.icon,
+    cover: header.cover,
+    cover_offset: header.cover_offset,
     document: converter.data,
     links: converter.links,
     has_content,
@@ -81,7 +84,32 @@ fn select_first<'a>(html: &'a Html, selector: &str) -> Option<ElementRef<'a>> {
   html.select(&selector).next()
 }
 
-fn page_header(html: &Html) -> (Option<PageIcon>, Option<String>) {
+/// The icon and the cover of a page of a Notion HTML export.
+pub struct PageHeader {
+  pub icon: Option<PageIcon>,
+  pub cover: Option<String>,
+  pub cover_offset: Option<f64>,
+}
+
+/// Parse the icon and the cover of a page of a Notion HTML export.
+pub fn parse_notion_html_header(html: &str) -> PageHeader {
+  page_header(&Html::parse_document(html))
+}
+
+/// The names of the columns of the database that a page of a Notion HTML export shows, in the
+/// order of its table. Columns that the view hides are not part of it.
+pub fn parse_notion_html_columns(html: &str) -> Vec<String> {
+  let html = Html::parse_document(html);
+  let Ok(selector) = Selector::parse("table.collection-content thead th") else {
+    return vec![];
+  };
+  html
+    .select(&selector)
+    .map(|th| th.text().collect::<String>().trim().to_string())
+    .collect()
+}
+
+fn page_header(html: &Html) -> PageHeader {
   let icon = select_first(html, "article")
     .and_then(|article| article.value().attr("data-notion-page-icon"))
     .filter(|icon| !icon.is_empty())
@@ -91,10 +119,23 @@ fn page_header(html: &Html) -> (Option<PageIcon>, Option<String>) {
         .and_then(|img| img.value().attr("src"))
         .and_then(page_icon)
     });
-  let cover = select_first(html, "img.page-cover-image")
+  let cover_image = select_first(html, "img.page-cover-image");
+  let cover = cover_image
     .and_then(|img| img.value().attr("src"))
     .map(str::to_string);
-  (icon, cover)
+  // The style of the image has the part of it that is shown, such as `object-position:center 21%`.
+  let cover_offset = cover_image
+    .and_then(|img| img.value().attr("style"))
+    .and_then(|style| style.split("object-position:").nth(1))
+    .and_then(|position| position.split(';').next())
+    .and_then(|position| position.split_whitespace().nth(1))
+    .and_then(|y| y.trim_end_matches('%').parse::<f64>().ok())
+    .map(|percent| (percent / 50.0 - 1.0).clamp(-1.0, 1.0));
+  PageHeader {
+    icon,
+    cover,
+    cover_offset,
+  }
 }
 
 /// The icon of a page from the emoji, the path of a Notion icon or the path of an image that the
@@ -484,7 +525,9 @@ impl Converter {
 
   fn toggle(&mut self, parent: &str, details: ElementRef) {
     let (mut data, attrs) = block_colors(details);
-    data.insert(COLLAPSED_FIELD.to_string(), json!(false));
+    // The export marks every toggle as open, whatever its state in Notion, where a toggle starts
+    // closed.
+    data.insert(COLLAPSED_FIELD.to_string(), json!(true));
     let id = self.add_block(BlockType::ToggleList, parent, data);
     for child in details.children().filter_map(ElementRef::wrap) {
       match child.value().name() {
@@ -626,7 +669,20 @@ impl Converter {
       return;
     }
 
-    // Other figures, such as files and bookmarks, are kept as a link.
+    // A bookmark is a preview of the page it links to.
+    if let Some(href) = figure
+      .descendants()
+      .filter_map(ElementRef::wrap)
+      .find(|link| link.value().name() == "a" && has_class(*link, "bookmark"))
+      .and_then(|link| link.value().attr("href"))
+    {
+      let mut data = BlockData::new();
+      data.insert(URL_FIELD.to_string(), json!(href));
+      self.add_block(BlockType::LinkPreview, parent, data);
+      return;
+    }
+
+    // Other figures, such as files, are kept as a link.
     let mut delta = Delta::new();
     for link in figure
       .descendants()

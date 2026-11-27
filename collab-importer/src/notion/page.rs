@@ -11,7 +11,9 @@ use collab_entity::CollabType;
 use futures::stream::{self, StreamExt};
 
 use crate::notion::file::NotionFile;
-use crate::notion::html::{INLINE_DATABASE_FIELD, PageIcon, parse_notion_html};
+use crate::notion::html::{
+  INLINE_DATABASE_FIELD, PageIcon, parse_notion_html, parse_notion_html_columns,
+};
 use crate::notion::walk_dir::{extract_delta_link, extract_external_links, is_html_file};
 use crate::notion::{CSVRelation, ImportedCollabInfoStream};
 use crate::util::{FileId, upload_file_url};
@@ -205,7 +207,7 @@ impl NotionPage {
         }
 
         if let Some(PageIcon::Image(src)) = icon {
-          if let Some((_, Some(resource))) = self.icon_image(&src).await {
+          if let Some((_, Some(resource))) = self.image_url(&src).await {
             all_resources.push(resource);
           }
         }
@@ -229,9 +231,9 @@ impl NotionPage {
     }
   }
 
-  /// The URL of the image that is the icon of the page, and the file of the export that has to be
+  /// The URL of an image of the page, such as its icon, and the file of the export that has to be
   /// uploaded for it, if any. `src` is a link or the path of a file of the export.
-  pub async fn icon_image(&self, src: &str) -> Option<(String, Option<PathBuf>)> {
+  pub async fn image_url(&self, src: &str) -> Option<(String, Option<PathBuf>)> {
     if src.starts_with("http://") || src.starts_with("https://") {
       return Some((src.to_string(), None));
     }
@@ -623,7 +625,13 @@ impl NotionPage {
         row_documents,
         ..
       } => {
-        let content = fs::read_to_string(file_path).await?;
+        let mut content = fs::read_to_string(file_path).await?;
+        // The CSV file has the columns in the order of the properties, while the page of the
+        // database in a HTML export has them in the order of the table that Notion shows.
+        if let Ok(html) = fs::read_to_string(file_path.with_extension("html")).await {
+          let order = parse_notion_html_columns(&html);
+          content = reorder_csv_columns(&content, &order).unwrap_or(content);
+        }
         let files = self
           .notion_file
           .upload_files()
@@ -887,4 +895,72 @@ pub struct DatabaseImportContent {
   pub database: Database,
   pub row_documents: Vec<ImportedRowDocument>,
   pub resource: CollabResource,
+}
+
+/// Move the columns of a CSV file that are in `order` to the front, in that order, and keep the
+/// other columns after them. The first column is the title of the rows, so it stays the first.
+fn reorder_csv_columns(content: &str, order: &[String]) -> Option<String> {
+  let mut reader = csv::ReaderBuilder::new()
+    .has_headers(false)
+    .flexible(true)
+    .from_reader(content.as_bytes());
+  let rows: Vec<csv::StringRecord> = reader.records().collect::<Result<_, _>>().ok()?;
+  let header = rows.first()?;
+
+  let mut columns: Vec<usize> = vec![0];
+  for name in order {
+    if let Some(index) = header
+      .iter()
+      .position(|field| field.trim_start_matches('\u{feff}') == name)
+    {
+      if !columns.contains(&index) {
+        columns.push(index);
+      }
+    }
+  }
+  if columns.len() == 1 {
+    return None;
+  }
+  let rest: Vec<usize> = (0..header.len())
+    .filter(|index| !columns.contains(index))
+    .collect();
+  columns.extend(rest);
+
+  let mut writer = csv::Writer::from_writer(vec![]);
+  for row in &rows {
+    writer
+      .write_record(columns.iter().map(|index| row.get(*index).unwrap_or("")))
+      .ok()?;
+  }
+  String::from_utf8(writer.into_inner().ok()?).ok()
+}
+
+#[cfg(test)]
+mod reorder_csv_columns_tests {
+  use super::reorder_csv_columns;
+
+  #[test]
+  fn shown_columns_come_first_in_the_order_of_the_table() {
+    let csv = "Name,Hidden,Date,Status\na,h,d,s\n";
+    let order = ["Name", "Status", "Date"].map(String::from);
+    assert_eq!(
+      reorder_csv_columns(csv, &order).unwrap(),
+      "Name,Status,Date,Hidden\na,s,d,h\n"
+    );
+  }
+
+  #[test]
+  fn the_title_stays_first() {
+    let csv = "Name,Date\na,d\n";
+    let order = ["Date", "Name"].map(String::from);
+    assert_eq!(
+      reorder_csv_columns(csv, &order).unwrap(),
+      "Name,Date\na,d\n"
+    );
+  }
+
+  #[test]
+  fn unknown_columns_leave_the_file_as_it_is() {
+    assert!(reorder_csv_columns("Name,Date\na,d\n", &["Other".to_string()]).is_none());
+  }
 }
