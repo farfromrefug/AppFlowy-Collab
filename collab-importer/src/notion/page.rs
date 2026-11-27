@@ -3,7 +3,9 @@ use crate::imported_collab::{ImportType, ImportedCollab, ImportedCollabInfo};
 
 use collab_database::database::{Database, get_row_document_id};
 use collab_database::template::csv::{CSVResource, CSVTemplate};
-use collab_document::blocks::{BlockType, TextDelta, mention_block_data, mention_block_delta};
+use collab_document::blocks::{
+  Block, BlockType, TextDelta, mention_block_data, mention_block_delta,
+};
 use collab_document::document::Document;
 use collab_document::importer::define::URL_FIELD;
 use collab_document::importer::md_importer::{MDImporter, create_image_block};
@@ -253,7 +255,7 @@ impl NotionPage {
     Some((url, Some(resource)))
   }
 
-  /// Replace the paragraphs that stand for a database that the page shows with a link to it.
+  /// Replace the paragraphs that stand for a database that the page shows with the database.
   fn replace_inline_databases(&self, page_path: &Path, document: &mut Document) {
     let Some(page_id) = document.get_page_id() else {
       return;
@@ -262,16 +264,32 @@ impl NotionPage {
     while let Some(block_id) = stack.pop() {
       if let Some((_, mut data)) = document.get_block_data(&block_id) {
         if let Some(title) = data.remove(INLINE_DATABASE_FIELD) {
-          if let Some(view) = title
+          let database = title
             .as_str()
             .and_then(|title| self.csv_relation.find_page_by_name(title, page_path))
-          {
-            if let Err(err) =
-              document.set_block_delta(&block_id, vec![mention_block_delta(&view.view_id)])
-            {
-              error!("Failed to link an inline database. error: {:?}", err);
+            .and_then(|view| Some((database_id_of(&view.view_id)?, view)));
+          let parent = document.get_block(&block_id).map(|block| block.parent);
+          if let (Some((database_id, view)), Some(parent)) = (database, parent) {
+            let block = Block {
+              id: collab_document::document_data::generate_id(),
+              ty: BlockType::Grid.to_string(),
+              data: HashMap::from([
+                ("view_id".to_string(), json!(view.view_id)),
+                ("parent_id".to_string(), json!(self.view_id)),
+                ("database_id".to_string(), json!(database_id)),
+              ]),
+              parent,
+              children: String::new(),
+              external_id: None,
+              external_type: None,
+            };
+            let replaced = document
+              .insert_block(block, Some(block_id.clone()))
+              .and_then(|_| document.delete_block(&block_id));
+            if let Err(err) = replaced {
+              error!("Failed to show an inline database. error: {:?}", err);
             }
-            data.extend(mention_block_data(&view.view_id, &self.view_id));
+            continue;
           }
           if let Err(err) = document.update_block(&block_id, data) {
             error!(
@@ -649,6 +667,10 @@ impl NotionPage {
         let mut csv_template =
           CSVTemplate::try_from_reader(content.as_bytes(), true, Some(csv_resource))?;
         csv_template.reset_view_id(self.view_id.clone());
+        // The pages that show the database have to know its id without building it.
+        if let Some(id) = database_id_of(&self.view_id) {
+          csv_template.database_id = id;
+        }
         let database_id = csv_template.database_id.clone();
 
         let file_url_builder = FileUrlBuilderImpl {
@@ -895,6 +917,12 @@ pub struct DatabaseImportContent {
   pub database: Database,
   pub row_documents: Vec<ImportedRowDocument>,
   pub resource: CollabResource,
+}
+
+/// The id of the database of the CSV file of the view `view_id`.
+fn database_id_of(view_id: &str) -> Option<String> {
+  let view_id = uuid::Uuid::parse_str(view_id).ok()?;
+  Some(uuid::Uuid::new_v5(&view_id, b"database").to_string())
 }
 
 /// Move the columns of a CSV file that are in `order` to the front, in that order, and keep the
