@@ -77,6 +77,15 @@ impl CSVTemplate {
     })
   }
 
+  /// Set the type of the fields that are named in `types`, in place of the detected one.
+  pub fn override_field_types(&mut self, types: &HashMap<String, FieldType>) {
+    for field in self.fields.iter_mut() {
+      if let Some(field_type) = types.get(&field.name) {
+        field.field_type = *field_type;
+      }
+    }
+  }
+
   pub fn reset_view_id(&mut self, view_id: DatabaseViewId) {
     self.view_id = view_id;
   }
