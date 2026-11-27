@@ -11,7 +11,7 @@ use collab_entity::CollabType;
 use futures::stream::{self, StreamExt};
 
 use crate::notion::file::NotionFile;
-use crate::notion::html::parse_notion_html;
+use crate::notion::html::{INLINE_DATABASE_FIELD, PageIcon, parse_notion_html};
 use crate::notion::walk_dir::{extract_delta_link, extract_external_links, is_html_file};
 use crate::notion::{CSVRelation, ImportedCollabInfoStream};
 use crate::util::{FileId, upload_file_url};
@@ -146,12 +146,12 @@ impl NotionPage {
       NotionFile::Markdown { file_path, .. } => {
         let resource_paths = self.notion_file.upload_files();
         let content = fs::read_to_string(file_path).await?;
-        let (document_data, cover) = if is_html_file(file_path) {
+        let (document_data, cover, icon) = if is_html_file(file_path) {
           let page = parse_notion_html(&self.view_id, &content);
-          (page.document, page.cover)
+          (page.document, page.cover, page.icon)
         } else {
           let md_importer = MDImporter::new(None);
-          (md_importer.import(&self.view_id, content)?, None)
+          (md_importer.import(&self.view_id, content)?, None, None)
         };
         let mut document = Document::create(&self.view_id, document_data, default_client_id())?;
 
@@ -174,6 +174,7 @@ impl NotionPage {
             &url_builder,
           )
           .await;
+        self.replace_inline_databases(parent_path, &mut document);
         let valid_block_resources = self
           .replace_block_resources_recursively(
             parent_path,
@@ -203,6 +204,12 @@ impl NotionPage {
           }
         }
 
+        if let Some(PageIcon::Image(src)) = icon {
+          if let Some((_, Some(resource))) = self.icon_image(&src).await {
+            all_resources.push(resource);
+          }
+        }
+
         let files = all_resources
           .iter()
           .filter_map(|p| p.to_str().map(|s| s.to_string()))
@@ -219,6 +226,62 @@ impl NotionPage {
         "File type is not supported for document: {:?}",
         self.notion_file
       ))),
+    }
+  }
+
+  /// The URL of the image that is the icon of the page, and the file of the export that has to be
+  /// uploaded for it, if any. `src` is a link or the path of a file of the export.
+  pub async fn icon_image(&self, src: &str) -> Option<(String, Option<PathBuf>)> {
+    if src.starts_with("http://") || src.starts_with("https://") {
+      return Some((src.to_string(), None));
+    }
+    let decoded = percent_decode_str(src).decode_utf8().ok()?;
+    let path = self
+      .notion_file
+      .file_path()?
+      .parent()?
+      .join(decoded.as_ref());
+    let resource = self
+      .notion_file
+      .upload_files()
+      .into_iter()
+      .find(|r| *r == path)?;
+    let file_id = FileId::from_path(&path).await.ok()?;
+    let url = upload_file_url(&self.host, &self.workspace_id, &self.view_id, &file_id);
+    Some((url, Some(resource)))
+  }
+
+  /// Replace the paragraphs that stand for a database that the page shows with a link to it.
+  fn replace_inline_databases(&self, page_path: &Path, document: &mut Document) {
+    let Some(page_id) = document.get_page_id() else {
+      return;
+    };
+    let mut stack = vec![page_id];
+    while let Some(block_id) = stack.pop() {
+      if let Some((_, mut data)) = document.get_block_data(&block_id) {
+        if let Some(title) = data.remove(INLINE_DATABASE_FIELD) {
+          if let Some(view) = title
+            .as_str()
+            .and_then(|title| self.csv_relation.find_page_by_name(title, page_path))
+          {
+            if let Err(err) =
+              document.set_block_delta(&block_id, vec![mention_block_delta(&view.view_id)])
+            {
+              error!("Failed to link an inline database. error: {:?}", err);
+            }
+            data.extend(mention_block_data(&view.view_id, &self.view_id));
+          }
+          if let Err(err) = document.update_block(&block_id, data) {
+            error!(
+              "Failed to update an inline database block. error: {:?}",
+              err
+            );
+          }
+        }
+      }
+      for child_id in document.get_block_children_ids(&block_id).into_iter().rev() {
+        stack.push(child_id);
+      }
     }
   }
 

@@ -505,13 +505,13 @@ fn process_csv_file(
   let (name, id) = name_and_id_from_path(path).ok()?;
   let file_size = get_file_size(&file_path).ok()?;
   let notion_file = NotionFile::CSV {
-    file_path,
+    file_path: file_path.clone(),
     size: file_size,
     resources,
     row_documents: vec![],
   };
 
-  Some(NotionPage {
+  let page = NotionPage {
     notion_name: name,
     notion_id: id,
     children: vec![],
@@ -522,7 +522,12 @@ fn process_csv_file(
     workspace_id: workspace_id.to_string(),
     is_dir: false,
     csv_relation: notion_export.csv_relation.clone(),
-  })
+  };
+
+  notion_export
+    .csv_relation
+    .set_page_by_path_buf(file_path, page.clone());
+  Some(page)
 }
 
 fn process_md_file(

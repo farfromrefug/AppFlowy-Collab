@@ -19,7 +19,7 @@ use collab::preclude::Collab;
 use collab_entity::CollabType;
 use csv::Reader;
 use fancy_regex::Regex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
@@ -321,8 +321,14 @@ async fn convert_notion_page_to_parent_child(
     .with_layout(view_layout)
     .with_view_id(&notion_page.view_id);
 
-  if let Some(PageIcon::Emoji(emoji)) = html_page_icon(&notion_page.notion_file).await {
-    view_builder = view_builder.with_icon(&emoji);
+  match html_page_icon(&notion_page.notion_file).await {
+    Some(PageIcon::Emoji(emoji)) => view_builder = view_builder.with_icon(&emoji),
+    Some(PageIcon::Image(src)) => {
+      if let Some((url, _)) = notion_page.icon_image(&src).await {
+        view_builder = view_builder.with_icon_url(&url);
+      }
+    },
+    None => {},
   }
 
   for child_notion_page in &notion_page.children {
@@ -384,6 +390,25 @@ impl CSVRelation {
   pub fn get_page(&self, file_name: &str) -> Option<NotionPage> {
     let path = self.inner.get(&file_name.to_lowercase())?;
     self.page_by_path_buf.lock().ok()?.get(path).cloned()
+  }
+
+  /// The database that has the title `name`. A title that Notion cut to name the file matches too,
+  /// and the database that is the closest to `near` wins.
+  pub fn find_page_by_name(&self, name: &str, near: &Path) -> Option<NotionPage> {
+    let name = name.trim();
+    let pages = self.page_by_path_buf.lock().ok()?;
+    let mut candidates: Vec<(&PathBuf, &NotionPage)> = pages
+      .iter()
+      .filter(|(_, page)| {
+        let page_name = page.notion_name.trim();
+        !page_name.is_empty() && (page_name == name || name.starts_with(page_name))
+      })
+      .collect();
+    candidates.sort_by_key(|(path, page)| {
+      let same_dir = path.parent() == near.parent();
+      (!same_dir, page.notion_name.trim() != name, (*path).clone())
+    });
+    candidates.first().map(|(_, page)| (*page).clone())
   }
 
   pub fn set_page_by_path_buf(&self, path_buf: PathBuf, page: NotionPage) {

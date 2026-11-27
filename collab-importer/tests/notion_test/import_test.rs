@@ -829,8 +829,9 @@ fn verify_first_level_views(first_level_views: &[Arc<View>], folder: &mut Folder
       },
       "Home" => {
         assert_eq!(second_level_views.len(), 2);
-        assert_eq!(second_level_views[0].name, "Home views");
-        assert_eq!(second_level_views[1].name, "My tasks");
+        // Sub pages follow the order their links have in the Home page.
+        assert_eq!(second_level_views[0].name, "My tasks");
+        assert_eq!(second_level_views[1].name, "Home views");
       },
       "Root" => {
         assert_eq!(second_level_views.len(), 3);

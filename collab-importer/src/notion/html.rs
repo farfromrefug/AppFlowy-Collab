@@ -26,6 +26,10 @@ const ENABLE_HEADER_ROW_FIELD: &str = "enable_header_row";
 const ENABLE_HEADER_COLUMN_FIELD: &str = "enable_header_column";
 const COLUMN_WIDTHS_FIELD: &str = "column_widths";
 
+/// The data of a paragraph that stands for a database that the page shows. Its value is the title
+/// of the database, and the importer replaces the paragraph with a link to the database.
+pub(crate) const INLINE_DATABASE_FIELD: &str = "notion_database";
+
 /// The icon of a Notion page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageIcon {
@@ -366,7 +370,7 @@ impl Converter {
         if has_class(element, "column-list") {
           self.columns(parent, element);
         } else if has_class(element, "collection-content") {
-          // Databases are imported from their CSV file.
+          self.inline_database(parent, element);
         } else {
           self.children_as_blocks(parent, element);
         }
@@ -375,6 +379,25 @@ impl Converter {
       "section" | "article" | "main" => self.children_as_blocks(parent, element),
       _ => {},
     }
+  }
+
+  /// A database shown in the page is imported from its own CSV file. The page gets a paragraph
+  /// with the title of the database, which the importer turns into a link to it.
+  fn inline_database(&mut self, parent: &str, element: ElementRef) {
+    let title = Selector::parse(".collection-title")
+      .ok()
+      .and_then(|selector| element.select(&selector).next())
+      .map(|title| title.text().collect::<String>().trim().to_string())
+      .unwrap_or_default();
+    if title.is_empty() {
+      return;
+    }
+    let mut data = BlockData::new();
+    data.insert(INLINE_DATABASE_FIELD.to_string(), json!(title));
+    let id = self.add_block(BlockType::Paragraph, parent, data);
+    let mut delta = Delta::new();
+    delta.insert(title, vec![]);
+    self.append_delta(&id, delta);
   }
 
   /// Fill `block_id` with the text of `element` and the blocks nested in it.

@@ -181,6 +181,14 @@ impl NestedChildViewBuilder {
     self
   }
 
+  pub fn with_icon_url(mut self, url: &str) -> Self {
+    self.icon = Some(ViewIcon {
+      ty: IconType::Url,
+      value: url.to_string(),
+    });
+    self
+  }
+
   pub fn with_extra<F: FnOnce(ViewExtraBuilder) -> serde_json::Value>(mut self, extra: F) -> Self {
     let builder = ViewExtraBuilder::new();
     let extra_json = extra(builder);
